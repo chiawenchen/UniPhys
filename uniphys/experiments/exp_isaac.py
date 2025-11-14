@@ -156,7 +156,6 @@ class IsaacHumanoidExperiment(BaseLightningExperiment):
             self.algo.action_mean, self.algo.action_std = stats["ActionMean"], stats["ActionStd"]
             if "zMean" in stats:
                 self.algo.z_mean, self.algo.z_std = stats["zMean"], stats["zStd"]
-
         else:
             raise ValueError("Pretrained checkpoint missing!")
         

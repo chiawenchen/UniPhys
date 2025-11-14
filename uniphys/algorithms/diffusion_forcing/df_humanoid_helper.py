@@ -57,7 +57,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             self.ema_decay = cfg.diffusion.ema_decay
             self.ema_model = None
 
-        self.text_embedding_dict = joblib.load("data/babel_state-action-text-pairs/text_embedding_dict_clip.pkl")
+        self.text_embedding_dict = joblib.load(cfg.text_embedding_dict_path)
         super().__init__(cfg)
      
         # Now that self.cfg exists, ensure it's set there too (in case downstream code reads from self.cfg)
@@ -437,12 +437,114 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
 
         return torch.from_numpy(np.stack(states)).cuda()
 
+    def _prepare_chunk_noise(
+        self,
+        horizon: int,
+        batch_size: int,
+        action_noise=None,
+        state_noise=None,
+        device: torch.device = torch.device("cuda"),
+    ) -> torch.Tensor:
+        """
+        Build a noise tensor for the diffusion chunk.
 
-    def policy(self):
+        The tensor has shape ``(horizon, batch_size, self.x_stacked_shape[0])``.
+        Action noise occupies the first ``action_dim * frame_stack`` channels,
+        followed by state noise occupying ``state_dim * frame_stack`` channels.
+
+        Args:
+            horizon: Number of future tokens to generate.
+            batch_size: Number of parallel environments.
+            action_noise: Optional noise for the action channels.
+                Accepted shapes (torch.Tensor or np.ndarray):
+                    - (batch_size, action_dim)
+                    - (1, batch_size, action_dim)
+                    - (horizon, batch_size, action_dim)
+                    - Same as above but already expanded to
+                      ``action_dim * frame_stack``.
+            state_noise: Optional noise for the state channels. Same shape
+                conventions as ``action_noise`` but with ``state_dim``.
+            device: Target device for the resulting tensor.
+
+        Returns:
+            Noise tensor ready to be concatenated with the history tokens.
+        """
+
+        def _to_tensor(data):
+            if data is None:
+                return None
+            if isinstance(data, np.ndarray):
+                data = torch.from_numpy(data)
+            return data.to(device=device, dtype=torch.float32)
+
+        def _expand_noise(noise, dim):
+            if noise is None:
+                return None
+
+            # Move to (horizon, batch, dim) layout.
+            if noise.ndim == 1:
+                noise = noise.view(1, 1, -1)
+            elif noise.ndim == 2:
+                noise = noise.unsqueeze(0)  # (1, B, D)
+            elif noise.ndim != 3:
+                raise ValueError(f"Unsupported noise dimensionality: {noise.shape}")
+
+            # Repeat along horizon if necessary.
+            if noise.shape[0] == 1 and horizon > 1:
+                noise = noise.expand(horizon, -1, -1).clone()
+            elif noise.shape[0] != horizon:
+                raise ValueError(
+                    f"Noise first dimension ({noise.shape[0]}) must be 1 or horizon ({horizon})."
+                )
+
+            # Repeat along batch if needed.
+            if noise.shape[1] == 1 and batch_size > 1:
+                noise = noise.expand(-1, batch_size, -1).clone()
+            elif noise.shape[1] != batch_size:
+                raise ValueError(
+                    f"Noise batch dimension ({noise.shape[1]}) must be 1 or batch_size ({batch_size})."
+                )
+
+            # Allow providing per-frame noise or already stacked noise.
+            expected = dim
+            per_frame_dim = dim // self.frame_stack
+            if noise.shape[2] == per_frame_dim:
+                noise = noise.repeat_interleave(self.frame_stack, dim=-1)
+            elif noise.shape[2] != expected:
+                raise ValueError(
+                    f"Noise feature dimension ({noise.shape[2]}) must be either "
+                    f"{per_frame_dim} or {expected}."
+                )
+            return noise
+
+        action_noise = _expand_noise(_to_tensor(action_noise), self.action_dim * self.frame_stack)
+        state_noise = _expand_noise(_to_tensor(state_noise), self.state_dim * self.frame_stack)
+
+        chunk = torch.randn((horizon, batch_size, self.x_stacked_shape[0]), device=device)
+
+        if action_noise is not None:
+            chunk[..., : self.action_dim * self.frame_stack] = action_noise
+
+        if state_noise is not None:
+            chunk[..., self.action_dim * self.frame_stack :] = state_noise
+
+        return torch.clamp(chunk, -self.clip_noise, self.clip_noise)
+
+    def policy(self, chunk_noise= None, action_noise=None, state_noise=None):
         """
         Policy function for generating actions using a diffusion-based model.
         It processes buffered states and actions, builds conditional input sequences,
         and runs iterative denoising with optional classifier-free guidance.
+
+        Args:
+            chunk_noise: Optional tensor with shape
+                ``(horizon, batch_size * n_samples, self.x_stacked_shape[0])``
+                that specifies the initial noise for the future tokens.
+                When provided, it overrides random noise sampling.
+            action_noise: Convenience argument to supply action-only noise.
+                When provided, ``chunk_noise`` is ignored and a chunk is
+                constructed with ``action_noise`` (and optional ``state_noise``).
+            state_noise: Convenience argument to supply state-only noise.
         """
         # Use EMA model for inference if it's enabled.
         if self.use_ema and self.ema_model is not None:
@@ -455,7 +557,6 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
         # Select representation list depending on root inclusion
         # -------------------------------------------------------
         REPR_LIST = self._state_repr_names()
-
 
         # -------------------------------------------------------
         # Collect buffered history (limited by context length)
@@ -514,8 +615,35 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
         # -------------------------------------------------------
         # Sample-based search [search is optional, disable search with self.n_samples=1]
         # -------------------------------------------------------
-        B = self.env.task.num_envs * self.n_samples
-        chunk = torch.randn((horizon, B, *self.x_stacked_shape)).cuda()
+        B = self.num_envs * self.n_samples
+        device = xs_pred.device
+
+        if chunk_noise is not None or action_noise is not None or state_noise is not None:
+            if chunk_noise is not None and (action_noise is not None or state_noise is not None):
+                raise ValueError("Provide either chunk_noise or (action_noise/state_noise), not both.")
+
+            if chunk_noise is not None:
+                chunk = chunk_noise.to(device=device, dtype=torch.float32)
+                if chunk.shape != (horizon, B, *self.x_stacked_shape):
+                    if chunk.shape == (horizon, self.num_envs, *self.x_stacked_shape):
+                        chunk = chunk.repeat_interleave(self.n_samples, dim=1)
+                    else:
+                        raise ValueError(
+                            f"chunk_noise must have shape {(horizon, B, *self.x_stacked_shape)}, "
+                            f"got {chunk.shape}"
+                        )
+            else:
+                chunk = self._prepare_chunk_noise(
+                    horizon,
+                    self.num_envs,
+                    action_noise=action_noise,
+                    state_noise=state_noise,
+                    device=device,
+                )
+                if self.n_samples > 1:
+                    chunk = chunk.repeat_interleave(self.n_samples, dim=1)
+        else:
+            chunk = torch.randn((horizon, B, *self.x_stacked_shape), device=device)
         chunk = torch.clamp(chunk, -self.clip_noise, self.clip_noise)
 
         if xs_pred is not None:
@@ -591,6 +719,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             state_pred = state_pred * torch.from_numpy(self.state_std).cuda() + torch.from_numpy(self.state_mean).cuda()
 
         return action_pred, state_pred
+
     
 
     @torch.no_grad()
@@ -978,3 +1107,137 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             joblib.dump(final_data, save_path)
             print(f"Saved {len(final_data['text'])} episodes to {save_path}")
 
+
+    @torch.no_grad()
+    def predict_chunk(
+        self,
+        action_noise=None,
+        state_noise=None,
+        chunk_noise=None,
+        *,
+        num_steps: int = None,
+    ):
+        """
+        Run the diffusion policy once and return an open-loop chunk of actions
+        (and states) for the requested number of steps.
+
+        Args:
+            action_noise: Optional noise to apply to the action channels.
+            state_noise: Optional noise to apply to the state channels.
+            chunk_noise: Optional tensor that sets the noise for both action and
+                state channels. If provided, it must already be expanded to
+                ``(horizon, batch_size * n_samples, self.x_stacked_shape[0])`` or
+                ``(horizon, batch_size, self.x_stacked_shape[0])``.
+            num_steps: Number of consecutive steps to return. Defaults to
+                ``self.exec_step`` when ``None``.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: ``(action_chunk, state_chunk)``
+            each with shape ``(num_steps, batch, dim)`` in the original
+            (de-normalized) space.
+        """
+
+        device = getattr(self, "device", torch.device("cuda"))
+        if num_steps is None:
+            num_steps = max(1, getattr(self, "exec_step", 1))
+        else:
+            num_steps = max(1, num_steps)
+
+        if len(self.root_state_buffer.buffer) < 2:
+            base_action = torch.from_numpy(self.a_mean).to(device).repeat(self.num_envs, 1)
+            base_state = torch.from_numpy(self.state_mean).to(device).repeat(self.num_envs, 1)
+            action_chunk = base_action.unsqueeze(0).repeat(num_steps, 1, 1)
+            state_chunk = base_state.unsqueeze(0).repeat(num_steps, 1, 1)
+            return action_chunk, state_chunk
+        
+        if not hasattr(self, "guidance_fn"):
+            self.guidance_fn = None
+        if not hasattr(self, "n_samples"):
+            self.n_samples = 1
+
+        horizon = self.chunk_size // self.frame_stack
+
+        if chunk_noise is not None and (action_noise is not None or state_noise is not None):
+            raise ValueError("Provide either chunk_noise or (action_noise/state_noise), not both.")
+
+        if chunk_noise is not None and chunk_noise.dim() == 3 and chunk_noise.shape[1] == self.num_envs:
+            chunk_noise = chunk_noise.repeat_interleave(self.n_samples, dim=1)
+
+        self.preprocess_text()
+        action_pred, state_pred = self.policy(
+            chunk_noise=chunk_noise,
+            action_noise=action_noise,
+            state_noise=state_noise,
+        )
+        action_exec = action_pred[self.H:].permute(1, 0, 2).float()
+        state_exec = state_pred[self.H:].permute(1, 0, 2).float()
+
+        total_steps = action_exec.shape[1]
+        steps_to_take = min(num_steps, total_steps)
+        action_slice = action_exec[:, :steps_to_take]
+        state_slice = state_exec[:, :steps_to_take]
+
+        action_chunk = action_slice.permute(1, 0, 2).contiguous()
+        state_chunk = state_slice.permute(1, 0, 2).contiguous()
+
+        if action_chunk.shape[0] < num_steps:
+            pad_len = num_steps - action_chunk.shape[0]
+            action_pad = action_chunk[-1:].repeat(pad_len, 1, 1)
+            state_pad = state_chunk[-1:].repeat(pad_len, 1, 1)
+            action_chunk = torch.cat([action_chunk, action_pad], dim=0)
+            state_chunk = torch.cat([state_chunk, state_pad], dim=0)
+
+        return action_chunk, state_chunk
+
+    @torch.no_grad()
+    def predict_one_step(self, action_noise=None, state_noise=None, chunk_noise=None):
+        """
+        Helper to predict the next action/state pair for the current environment state.
+
+        This mirrors the logic used inside :meth:`interact`, but only returns the
+        first step of the open-loop rollout.
+        """
+
+        action_chunk, _ = self.predict_chunk(
+            action_noise=action_noise,
+            state_noise=state_noise,
+            chunk_noise=chunk_noise,
+            num_steps=1,
+        )
+        return action_chunk[0]
+
+    def set_normalization_stats(self, action_mean, action_std, state_mean, state_std):
+        self.a_mean = action_mean
+        self.a_std = action_std
+        self.state_mean = state_mean
+        self.state_std = state_std
+
+    def load_checkpoint(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        if "state_dict" in checkpoint:
+            self.load_state_dict(checkpoint["state_dict"], strict=False)
+        else:
+            self.load_state_dict(checkpoint, strict=False)
+
+    def preprocess_text(self):
+        # preprocess text
+        if not self.cfg.skip_text and self.cfg.guidance_params > 0:
+            self.guidance_params = self.cfg.guidance_params
+            if self.cfg.interactive_input_prompt:
+                if flags.prompt:
+                    text = input("\033[34mEnter the text prompt: \033[0m")
+                    flags.prompt = False
+                    print("\033[1mPress Q to input new command and goal\033[0m")
+                else:
+                    text = text
+            else:
+                text = self.cfg.text_prompt
+
+            if text not in self.text_embedding_dict:
+                self.text_embedding = encode_text(self.clip_model, [text])
+            else:
+                self.text_embedding = torch.from_numpy(self.text_embedding_dict[text]) # [1, 512]
+        else:
+            text = None
+            self.text_embedding = torch.zeros((1, 512))
+        return text, self.text_embedding

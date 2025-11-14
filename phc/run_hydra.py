@@ -318,6 +318,7 @@ def main(cfg_hydra: DictConfig) -> None:
     cfg_train['params']['config']['network_path'] = cfg.output_path
     cfg_train['params']['config']['train_dir'] = cfg.output_path
     cfg_train["params"]["config"]["num_actors"] = cfg.env.num_envs
+    cfg_train["params"]["config"]["eval_fps_episodes"] = int(cfg.get("eval_fps_episodes", 0))
     
     if cfg.epoch > 0:
         cfg_train["params"]["load_checkpoint"] = True

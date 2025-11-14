@@ -154,8 +154,14 @@ diffusion_forcing/algorithm=df_humanoid_steer \
 diffusion_forcing.load="output/UniPhys/checkpoints/uniphys_T32.ckpt" \
 diffusion_forcing.algorithm.diffusion.use_ema=False \
 diffusion_forcing.task="interact" \
-+diffusion_forcing.name=play_steering
++diffusion_forcing.name=play_steering \
+phc.env.tar_speed_min=0.5 phc.env.tar_speed_min=2.5 \
+phc.env.change_steps_min=200 phc.env.change_steps_max=201 \
+
+
 ```
+
+**Note:** If you encounter `OSError: Pillow was built without XCB support`, add `phc.no_virtual_display=True` to your command. This uses camera sensors instead of virtual display for rendering.
 
 ### 🚧 Dynamic-object Avoidance
 ```
@@ -240,6 +246,19 @@ diffusion_forcing.task="training" \
 ```
 We evaluate the policy every 100 training epochs with unconditional random generation, and the training loss and evaluation metrics (episode lengths) are logged with Wandb.
 
+## 🔧 Troubleshooting
+
+### Pillow XCB Support Error
+If you encounter `OSError: Pillow was built without XCB support` when running with `phc.headless=False`, add `phc.no_virtual_display=True` to your command. This flag makes the code use Isaac Gym's camera sensors instead of virtual display for rendering, which avoids the Pillow XCB dependency.
+
+Example:
+```bash
+python main.py \
+phc/env=env_im_vae_steer \
+phc.headless=False \
+phc.no_virtual_display=True \
+# ... other arguments
+```
 
 ## Acknowledgements
 Our code build upon these great repositories:

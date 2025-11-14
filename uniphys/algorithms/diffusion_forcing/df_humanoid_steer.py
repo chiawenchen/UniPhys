@@ -260,9 +260,16 @@ class DiffusionForcingHumanoidSteer(DiffusionForcingHumanoid):
 
         self.max_episode_length = self.env.task.max_episode_length
         self.max_episode = 1
-        # warm_up_step = self.context_frames + 1
-        max_steps = (self.max_episode) * self.max_episode_length
-        self.pbar = tqdm(range(self.max_episode_length))
+
+        # If trajectory collection is active, run until maxEpisodesToCollect is reached.
+        # Each episode is at most max_episode_length steps, so use that as a generous upper bound.
+        max_episodes_to_collect = getattr(self.env.task, "_max_episodes_to_collect", None)
+        collecting = getattr(self.env.task, "_collect_joint_positions", False)
+        if collecting and max_episodes_to_collect is not None:
+            max_steps = max_episodes_to_collect * self.max_episode_length
+        else:
+            max_steps = self.max_episode_length
+        self.pbar = tqdm(total=max_steps)
 
         # === Loop ===
         t, e, reset_flag = 0, 0, False
@@ -282,13 +289,35 @@ class DiffusionForcingHumanoidSteer(DiffusionForcingHumanoid):
             save_dir = None
 
 
-        while t < max_steps and e < self.max_episode:
+        last_episode_status = None  # "fallen" or "timeout" for trajectory collection
+        # Roll out until maxEpisodesToCollect is reached (or max_steps as a safety cap).
+        finalized_on_fall = False
+        while t < max_steps:
+            # Early exit once target episode count is collected
+            if collecting and max_episodes_to_collect is not None:
+                if getattr(self.env.task, "_total_episodes_collected", 0) >= max_episodes_to_collect:
+                    break
             # --- Episode init ---
             done_indices = []
 
             if t == 0 or reset_flag:
+                # If we reached here due to a fall, we already finalized in the done.any() handler.
+                # For any other reset path, finalize the previous segment here.
+                if (not finalized_on_fall) and e > 0 and getattr(self.env.task, "_collect_joint_positions", False):
+                    if last_episode_status is not None and getattr(self.env.task, "set_episode_status", None) is not None:
+                        self.env.task.set_episode_status(torch.arange(num_envs), last_episode_status)
+                    if getattr(self.env.task, "finalize_episode_trajectory", None) is not None:
+                        self.env.task.finalize_episode_trajectory(torch.arange(num_envs))
+                if save_dir is not None and getattr(self.env.task, "set_trajectory_save_dir", None) is not None:
+                    self.env.task.set_trajectory_save_dir(save_dir)
                 obs_dict = self.player.env_reset()
                 reset_flag = False
+                last_episode_status = None
+                finalized_on_fall = False
+                # Clear history buffers so the warm-up loop always re-fills them from the new episode.
+                # Without this, after a fall the buffers still hold old-episode data, the warm-up is
+                # skipped, and obs_dict (a dict from env_reset) is passed raw to dec_action, crashing.
+                self._clear_hist_buffer()
                 self.env.task.set_char_color(col=[0, 0.5, 0.8], env_ids=torch.arange(self.env.task.num_envs))  ## blue
 
                 while len(self.root_state_buffer.buffer) < self.context_frames:
@@ -382,29 +411,66 @@ class DiffusionForcingHumanoidSteer(DiffusionForcingHumanoid):
                     done = self.post_step(info, done.clone(), save_dir=save_dir)
 
                     if done.any():
+                        # Use _terminate_buf to distinguish physical fall from motion-clip-end/timeout.
+                        # _terminate_buf=1 means actual contact+height termination; =0 means clip ended.
+                        terminate_buf = self.env.task._terminate_buf
+                        done_mask = done.bool()
+                        if terminate_buf[done_mask].any():
+                            last_episode_status = "fallen"
+                            episode_status_for_envs = "fallen"
+                            print("\033[31mFailed!\033[0m")
+                        else:
+                            last_episode_status = "clip_end"
+                            episode_status_for_envs = "clip_end"
+                            print("\033[33mClip end (motion reference exhausted).\033[0m")
+                        # Trajectory collection: finalize and save immediately,
+                        # so early terminations (before first speed change) still produce a trajectory.
+                        if getattr(self.env.task, "_collect_joint_positions", False):
+                            done_env_ids = done.nonzero(as_tuple=False).flatten()
+                            if done_env_ids.numel() > 0:
+                                if getattr(self.env.task, "set_episode_status", None) is not None:
+                                    self.env.task.set_episode_status(done_env_ids, episode_status_for_envs)
+                                if getattr(self.env.task, "finalize_episode_trajectory", None) is not None:
+                                    self.env.task.finalize_episode_trajectory(done_env_ids)
+                                finalized_on_fall = True
                         reset_flag = True
                         e += 1
-                        print("\033[31mFailed!\033[0m")
                         break
 
-        self.pred_pos_all = np.stack(self.pred_pos_all).squeeze()
-        self.pred_dof_pos_all = np.stack(self.pred_dof_pos_all).squeeze()
-        self.root_state_all = np.stack(self.root_state_all).squeeze()
-        self.dof_state_all = np.stack(self.dof_state_all).squeeze()
-        self.action_all = np.stack(self.action_all).squeeze()
-        self.target_speed_all = np.stack(self.target_speed_all).squeeze()
-        self.target_dir_all = np.stack(self.target_dir_all).squeeze()
-        self.target_facing_dir_all = np.stack(self.target_facing_dir_all).squeeze()
+        # If episode ended by timeout (exited loop without break), save trajectory
+        # At the end of rollout, finalize whatever is currently in the buffer as "timeout"/end-of-rollout.
+        if getattr(self.env.task, "_collect_joint_positions", False):
+            if getattr(self.env.task, "set_episode_status", None) is not None:
+                self.env.task.set_episode_status(torch.arange(num_envs), "timeout")
+            if getattr(self.env.task, "finalize_episode_trajectory", None) is not None:
+                self.env.task.finalize_episode_trajectory(torch.arange(num_envs))
+        if getattr(self.env.task, "save_remaining_trajectories", None) is not None:
+            self.env.task.save_remaining_trajectories()
 
-        save_info = {"body_pos": self.pred_pos_all, 
-                     "dof_pos": self.pred_dof_pos_all, 
-                     "root_state": self.root_state_all, 
-                     "dof_state": self.dof_state_all, 
-                     "action": self.action_all, 
-                     "target_speed": self.target_speed_all,
-                     "target_dir": self.target_dir_all,
-                     "target_face_dir": self.target_facing_dir_all,
-                     }
-        
-        joblib.dump(save_info, os.path.join(save_dir, "steering_steps{}_e{}.pkl".format(max_steps, e)))
-        print("Saved at {}".format(os.path.join(save_dir, "steering_steps{}_e{}.pkl".format(max_steps, e))))
+        # Only stack and save if save_dir is not None (i.e., save=True) and lists are not empty
+        if save_dir is not None and len(self.pred_pos_all) > 0:
+            self.pred_pos_all = np.stack(self.pred_pos_all).squeeze()
+            self.pred_dof_pos_all = np.stack(self.pred_dof_pos_all).squeeze()
+            self.root_state_all = np.stack(self.root_state_all).squeeze()
+            self.dof_state_all = np.stack(self.dof_state_all).squeeze()
+            self.action_all = np.stack(self.action_all).squeeze()
+            self.target_speed_all = np.stack(self.target_speed_all).squeeze()
+            self.target_dir_all = np.stack(self.target_dir_all).squeeze()
+            self.target_facing_dir_all = np.stack(self.target_facing_dir_all).squeeze()
+
+            save_info = {"body_pos": self.pred_pos_all, 
+                        "dof_pos": self.pred_dof_pos_all, 
+                        "root_state": self.root_state_all, 
+                        "dof_state": self.dof_state_all, 
+                        "action": self.action_all, 
+                        "target_speed": self.target_speed_all,
+                        "target_dir": self.target_dir_all,
+                        "target_face_dir": self.target_facing_dir_all,
+                        }
+            
+            joblib.dump(save_info, os.path.join(save_dir, "steering_steps{}_e{}.pkl".format(max_steps, e)))
+            print("Saved at {}".format(os.path.join(save_dir, "steering_steps{}_e{}.pkl".format(max_steps, e))))
+        elif save_dir is not None:
+            print("Warning: save_dir is set but no data was collected. Skipping save.")
+
+        return

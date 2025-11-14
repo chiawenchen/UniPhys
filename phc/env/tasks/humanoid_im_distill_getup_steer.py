@@ -28,6 +28,8 @@ from rl_games.algos_torch import torch_ext
 import torch.nn as nn
 from phc.learning.network_loader import load_mcp_mlp, load_pnn
 from collections import deque
+import os
+import time
 
 from isaac_utils import torch_utils, rotations
 
@@ -97,12 +99,54 @@ class HumanoidImDistillGetupSteer(humanoid_im_distill_getup.HumanoidImDistillGet
             [self.num_envs], device=self.device, dtype=torch.long
         )
 
+        # Trajectory collection (same format as humanoid_speed_any)
+        self._collect_joint_positions = getattr(cfg.env, "collect_trajectories", False) or getattr(cfg.env, "collect_joint_positions", False)
+        self._joint_positions_buffer = []
+        self._joint_positions_start_idx = [0] * self.num_envs
+        self._max_episodes_to_collect = getattr(cfg.env, "maxEpisodesToCollect", 1000)
+        self._total_episodes_collected = 0
+        self._episode_id_per_env = [0] * self.num_envs
+        self._episode_status_per_env = [None] * self.num_envs
+        self._episode_start_time = [None] * self.num_envs
+        self._all_trajectories = []
+        self._trajectory_save_dir = getattr(cfg.env, "trajectory_save_dir", "output/UniPhys/steer")
+        # When True, speed/direction change triggers a full scene reset (humanoid state reset)
+        # after saving the current segment, so each segment starts from a fresh reset state.
+        self._reset_scene_on_speed_change = getattr(cfg.env, "resetSceneOnSpeedChange", False)
+        if self._collect_joint_positions:
+            print(f"[DEBUG] Steer trajectory collection ENABLED: maxEpisodesToCollect={self._max_episodes_to_collect}, save_dir={self._trajectory_save_dir}", flush=True)
+        else:
+            print(f"[DEBUG] Steer trajectory collection OFF (collect_trajectories=False). Set +phc.env.collect_trajectories=True to collect.", flush=True)
 
         if not self.headless:
             self._build_marker_state_tensors()
 
         
         return
+
+    def set_trajectory_save_dir(self, save_dir):
+        self._trajectory_save_dir = save_dir
+
+    def set_episode_status(self, env_ids, episode_status):
+        if isinstance(env_ids, torch.Tensor):
+            env_ids_list = env_ids.detach().cpu().tolist()
+        else:
+            env_ids_list = list(env_ids)
+        for env_id in env_ids_list:
+            self._episode_status_per_env[env_id] = episode_status
+
+    def finalize_episode_trajectory(self, env_ids):
+        if not self._collect_joint_positions or env_ids is None:
+            return
+        n_envs = env_ids.numel() if isinstance(env_ids, torch.Tensor) else len(env_ids)
+        print(f"[DEBUG] Steer: finalize_episode_trajectory called for {n_envs} env(s), buffer size={len(self._joint_positions_buffer)}", flush=True)
+        self._save_joint_positions(env_ids)
+        env_ids_list = env_ids.detach().cpu().tolist() if isinstance(env_ids, torch.Tensor) else list(env_ids)
+        for env_id in env_ids_list:
+            self._episode_start_time[env_id] = None
+            self._episode_status_per_env[env_id] = None
+            self._joint_positions_start_idx[env_id] = len(self._joint_positions_buffer)
+            self._episode_id_per_env[env_id] = self._episode_id_per_env[env_id] + 1
 
     ###############################################################
     # Set up IsaacGym environment
@@ -324,10 +368,83 @@ class HumanoidImDistillGetupSteer(humanoid_im_distill_getup.HumanoidImDistillGet
                 self.viewer, env_ptr, curr_verts.shape[0], curr_verts, heading_cols
             )
 
+    def post_physics_step(self):
+        super().post_physics_step()
+        if not self._collect_joint_positions or self._total_episodes_collected >= self._max_episodes_to_collect:
+            return
+        current_time = time.time()
+        for env_id in range(self.num_envs):
+            if self._episode_start_time[env_id] is None:
+                self._episode_start_time[env_id] = current_time
+        num_bodies = self._rigid_body_pos.shape[1]
+        n_joints = min(24, num_bodies)
+        joint_pos = self._rigid_body_pos[:, :n_joints, :].cpu().numpy()
+        joint_rot = self._rigid_body_rot[:, :n_joints, :].cpu().numpy()
+        root_pos = self._humanoid_root_states[:, 0:3].cpu().numpy()
+        root_rot = self._humanoid_root_states[:, 3:7].cpu().numpy()
+        root_vel = self._humanoid_root_states[:, 7:10].cpu().numpy()
+        root_ang_vel = self._humanoid_root_states[:, 10:13].cpu().numpy()
+        dof_pos = self._dof_pos.cpu().numpy()
+        dof_vel = self._dof_vel.cpu().numpy()
+        tar_speed_frame = self._tar_speed.cpu().numpy()
+        tar_dir_frame = self._tar_dir.cpu().numpy()
+        tar_facing_dir_frame = self._tar_facing_dir.cpu().numpy()
+        frame_data = {
+            "rigid_body_pos": joint_pos,
+            "rigid_body_rot": joint_rot,
+            "root_pos": root_pos,
+            "root_rot": root_rot,
+            "root_vel": root_vel,
+            "root_ang_vel": root_ang_vel,
+            "dof_pos": dof_pos,
+            "dof_vel": dof_vel,
+            "tar_speed": tar_speed_frame,
+            "tar_dir": tar_dir_frame,
+            "tar_facing_dir": tar_facing_dir_frame,
+        }
+        self._joint_positions_buffer.append(frame_data)
+
 ###############################################################
 # Handle resets
 ###############################################################
+    def reset(self, env_ids=None):
+        if self._collect_joint_positions and env_ids is not None:
+            env_ids_list = env_ids.detach().cpu().tolist() if isinstance(env_ids, torch.Tensor) else list(env_ids)
+            if len(env_ids_list) > 0 and self._total_episodes_collected < self._max_episodes_to_collect:
+                self._save_joint_positions(env_ids)
+            for env_id in env_ids_list:
+                self._episode_start_time[env_id] = None
+                self._episode_status_per_env[env_id] = None
+                self._joint_positions_start_idx[env_id] = len(self._joint_positions_buffer)
+                self._episode_id_per_env[env_id] = self._episode_id_per_env[env_id] + 1
+        super().reset(env_ids=env_ids)
+
     def reset_task(self, env_ids):
+        # Save trajectory on speed/direction change (same as humanoid_speed_any),
+        # but only if we actually have frames collected for that env.
+        if len(env_ids) > 0 and self._collect_joint_positions and self._total_episodes_collected < self._max_episodes_to_collect:
+            env_ids_list = env_ids.detach().cpu().tolist() if isinstance(env_ids, torch.Tensor) else list(env_ids)
+            # Avoid saving at initialization (progress_buf==0) or when buffer has no new frames yet.
+            saveable = []
+            buf_len = len(self._joint_positions_buffer)
+            for eid in env_ids_list:
+                if buf_len == 0:
+                    continue
+                if int(self.progress_buf[eid].item()) == 0:
+                    continue
+                if self._joint_positions_start_idx[eid] >= buf_len:
+                    continue
+                saveable.append(eid)
+            if len(saveable) > 0:
+                save_env_ids = torch.tensor(saveable, device=self.device, dtype=torch.long)
+                for eid in saveable:
+                    self._episode_status_per_env[eid] = "speed_change"
+                self._save_joint_positions(save_env_ids)
+                for eid in saveable:
+                    self._episode_start_time[eid] = None
+                    self._episode_status_per_env[eid] = None
+                    self._joint_positions_start_idx[eid] = len(self._joint_positions_buffer)
+                    self._episode_id_per_env[eid] = self._episode_id_per_env[eid] + 1
         if len(env_ids) > 0:
             # Make sure the test has started + agent started from a valid position (if it failed, then it's not valid)
             active_envs = (self._current_accumulated_errors[env_ids] > 0) & (
@@ -345,6 +462,11 @@ class HumanoidImDistillGetupSteer(humanoid_im_distill_getup.HumanoidImDistillGet
                 (self._current_failures[env_ids][active_envs] > 0).cpu().tolist()
             )
             self._current_failures[env_ids] = 0
+
+        # Optional: reset humanoid/scene state on speed change (so each segment starts fresh).
+        # Use super().reset (NOT self.reset) to avoid double-saving in this class's reset().
+        if len(env_ids) > 0 and getattr(self, "_reset_scene_on_speed_change", False):
+            super().reset(env_ids=env_ids)
 
         # super().reset_task(env_ids)
         n = len(env_ids)
@@ -366,8 +488,8 @@ class HumanoidImDistillGetupSteer(humanoid_im_distill_getup.HumanoidImDistillGet
             - self.tar_speed_min
         ) * torch.rand(n, device=self.device) + self.tar_speed_min
         change_steps = torch.randint(
-            low=CHANGE_STEPS_MIN,
-            high=CHANGE_STEPS_MAX,
+            low=self.change_steps_min,
+            high=self.change_steps_max,
             size=(n,),
             device=self.device,
             dtype=torch.int64,
@@ -402,6 +524,152 @@ class HumanoidImDistillGetupSteer(humanoid_im_distill_getup.HumanoidImDistillGet
         if len(rest_env_ids) > 0:
             self.reset_task(rest_env_ids)
     
+
+    def _save_joint_positions(self, env_ids):
+        if len(self._joint_positions_buffer) == 0:
+            print("[WARNING] Steer: joint positions buffer empty, no trajectory to save. (post_physics_step may not be appending?)", flush=True)
+            return
+        if isinstance(env_ids, torch.Tensor):
+            env_ids_list = env_ids.detach().cpu().tolist()
+        elif isinstance(env_ids, np.ndarray):
+            env_ids_list = env_ids.tolist()
+        else:
+            env_ids_list = list(env_ids)
+        if len(env_ids_list) == 0 or self._total_episodes_collected >= self._max_episodes_to_collect:
+            return
+        os.makedirs(self._trajectory_save_dir, exist_ok=True)
+        timestamp = int(time.time())
+        for env_id in env_ids_list:
+            if self._total_episodes_collected >= self._max_episodes_to_collect:
+                break
+            start_idx = self._joint_positions_start_idx[env_id]
+            if start_idx >= len(self._joint_positions_buffer):
+                continue
+            rigid_body_pos_all = []
+            rigid_body_rot_all = []
+            root_pos_all = []
+            root_rot_all = []
+            root_vel_all = []
+            root_ang_vel_all = []
+            dof_pos_all = []
+            dof_vel_all = []
+            tar_speed_all = []
+            tar_dir_all = []
+            tar_facing_dir_all = []
+            for frame_data in self._joint_positions_buffer[start_idx:]:
+                rigid_body_pos_all.append(frame_data["rigid_body_pos"][env_id])
+                rigid_body_rot_all.append(frame_data["rigid_body_rot"][env_id])
+                root_pos_all.append(frame_data["root_pos"][env_id])
+                root_rot_all.append(frame_data["root_rot"][env_id])
+                root_vel_all.append(frame_data["root_vel"][env_id])
+                root_ang_vel_all.append(frame_data["root_ang_vel"][env_id])
+                dof_pos_all.append(frame_data["dof_pos"][env_id])
+                dof_vel_all.append(frame_data["dof_vel"][env_id])
+                tar_speed_all.append(frame_data["tar_speed"][env_id])
+                tar_dir_all.append(frame_data["tar_dir"][env_id])
+                tar_facing_dir_all.append(frame_data["tar_facing_dir"][env_id])
+            rigid_body_pos_stacked = np.stack(rigid_body_pos_all, axis=0)
+            rigid_body_rot_stacked = np.stack(rigid_body_rot_all, axis=0)
+            root_pos_stacked = np.stack(root_pos_all, axis=0)
+            root_rot_stacked = np.stack(root_rot_all, axis=0)
+            root_vel_stacked = np.stack(root_vel_all, axis=0)
+            root_ang_vel_stacked = np.stack(root_ang_vel_all, axis=0)
+            dof_pos_stacked = np.stack(dof_pos_all, axis=0)
+            dof_vel_stacked = np.stack(dof_vel_all, axis=0)
+            tar_speed_stacked = np.stack(tar_speed_all, axis=0)
+            tar_dir_stacked = np.stack(tar_dir_all, axis=0)
+            tar_facing_dir_stacked = np.stack(tar_facing_dir_all, axis=0)
+            episode_status = self._episode_status_per_env[env_id] or "unknown"
+            episode_id = self._episode_id_per_env[env_id]
+            num_frames = rigid_body_pos_stacked.shape[0]
+            start_time = self._episode_start_time[env_id]
+            elapsed_wall_time = (time.time() - start_time) if start_time is not None else num_frames * self.dt
+            fps_measured = num_frames / elapsed_wall_time if elapsed_wall_time > 0 else 0.0
+            total_time_sim = num_frames * self.dt
+            fps_sim = 1.0 / self.dt if self.dt > 0 else 0.0
+            tar_speed_np = float(self._tar_speed[env_id].detach().cpu().item())
+            tar_dir_np = self._tar_dir[env_id].detach().cpu().numpy()
+            tar_facing_dir_np = self._tar_facing_dir[env_id].detach().cpu().numpy()
+            target_velocity_2d = tar_dir_np * tar_speed_np
+            trajectory_data = {
+                "rigid_body_pos": rigid_body_pos_stacked,
+                "rigid_body_rot": rigid_body_rot_stacked,
+                "root_pos": root_pos_stacked,
+                "root_rot": root_rot_stacked,
+                "root_vel": root_vel_stacked,
+                "root_ang_vel": root_ang_vel_stacked,
+                "dof_pos": dof_pos_stacked,
+                "dof_vel": dof_vel_stacked,
+                "tar_speed": tar_speed_np,
+                "tar_dir": tar_dir_np,
+                "tar_facing_dir": tar_facing_dir_np,
+                "any_direction": True,
+                "separate_facing_dir": True,
+                "target_velocity_2d": target_velocity_2d,
+                "tar_speed_stacked": tar_speed_stacked,
+                "tar_dir_stacked": tar_dir_stacked,
+                "tar_facing_dir_stacked": tar_facing_dir_stacked,
+                "dt": self.dt,
+                "num_envs": 1,
+                "num_frames": num_frames,
+                "total_time": elapsed_wall_time,
+                "fps": fps_measured,
+                "total_time_sim": total_time_sim,
+                "fps_sim": fps_sim,
+                "env_id": env_id,
+                "episode_id": episode_id,
+                "episode_status": episode_status,
+                "total_episode_index": self._total_episodes_collected,
+            }
+            self._all_trajectories.append(trajectory_data)
+            self._total_episodes_collected += 1
+            print(f"[DEBUG] Steer saved trajectory {self._total_episodes_collected}/{self._max_episodes_to_collect}: env {env_id}, episode_id {episode_id}, status={episode_status}, frames={num_frames}", flush=True)
+            self._joint_positions_start_idx[env_id] = len(self._joint_positions_buffer)
+        if self._total_episodes_collected >= self._max_episodes_to_collect and len(self._all_trajectories) > 0:
+            print(f"\n[SAVE] Steer: reached collection limit. Saving {len(self._all_trajectories)} trajectories...")
+            self._save_all_trajectories(self._trajectory_save_dir, timestamp)
+        min_start = min(self._joint_positions_start_idx)
+        if min_start > 0:
+            self._joint_positions_buffer = self._joint_positions_buffer[min_start:]
+            self._joint_positions_start_idx = [idx - min_start for idx in self._joint_positions_start_idx]
+
+    def _save_all_trajectories(self, save_dir, timestamp):
+        if len(self._all_trajectories) == 0:
+            return
+        save_path = os.path.join(save_dir, f"speed_steer_{timestamp}.pkl")
+        total_trajectories = len(self._all_trajectories)
+        total_frames = sum(t["num_frames"] for t in self._all_trajectories)
+        total_wall_time = sum(t["total_time"] for t in self._all_trajectories)
+        status_counts = {}
+        for t in self._all_trajectories:
+            s = t.get("episode_status", "unknown")
+            status_counts[s] = status_counts.get(s, 0) + 1
+        all_data = {
+            "trajectories": self._all_trajectories,
+            "metadata": {
+                "num_trajectories": total_trajectories,
+                "total_frames": total_frames,
+                "total_wall_time": total_wall_time,
+                "avg_frames_per_trajectory": total_frames / total_trajectories if total_trajectories > 0 else 0,
+                "avg_wall_time_per_trajectory": total_wall_time / total_trajectories if total_trajectories > 0 else 0,
+                "status_counts": status_counts,
+                "dt": self.dt,
+                "timestamp": timestamp,
+                "fps": total_frames / total_wall_time if total_wall_time > 0 else 0,
+            },
+        }
+        joblib.dump(all_data, save_path)
+        print(f"\n[SUCCESS] Steer saved {total_trajectories} trajectories ({total_frames} frames) to {os.path.abspath(save_path)}")
+        print(f"         Status breakdown: {status_counts}\n")
+        self._all_trajectories = []
+
+    def save_remaining_trajectories(self):
+        if len(self._all_trajectories) == 0:
+            print("[DEBUG] Steer: save_remaining_trajectories called but no trajectories in memory (none saved yet this run).", flush=True)
+            return
+        os.makedirs(self._trajectory_save_dir, exist_ok=True)
+        timestamp = int(time.time())
+        self._save_all_trajectories(self._trajectory_save_dir, timestamp)
 
     def pre_physics_step(self, actions):
         super().pre_physics_step(actions)
