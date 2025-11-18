@@ -540,7 +540,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
                     chunk = chunk.repeat_interleave(self.n_samples, dim=1)
         else:
             chunk = torch.randn((horizon, B, *self.x_stacked_shape), device=device)
-            chunk = torch.clamp(chunk, -self.clip_noise, self.clip_noise)
+        chunk = torch.clamp(chunk, -self.clip_noise, self.clip_noise)
 
         if xs_pred is not None:
             # Repeat input across n_samples
@@ -1006,33 +1006,46 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             print(f"Saved {len(final_data['text'])} episodes to {save_path}")
 
     @torch.no_grad()
-    def predict_one_step(self, action_noise=None, state_noise=None, chunk_noise=None):
+    def predict_chunk(
+        self,
+        action_noise=None,
+        state_noise=None,
+        chunk_noise=None,
+        *,
+        num_steps: int = None,
+    ):
         """
-        Helper to predict the next action/state pair for the current environment state.
-
-        This mirrors the logic used inside :meth:`interact`, but only returns the
-        first step of the open-loop rollout. Optional noise can be provided either
-        as a full chunk tensor (``chunk_noise``) or separately for action/state
-        channels (``action_noise`` / ``state_noise``).
+        Run the diffusion policy once and return an open-loop chunk of actions
+        (and states) for the requested number of steps.
 
         Args:
-            action_noise: Optional noise to apply to the action channels. Accepted
-                shapes follow the conventions described in :meth:`_prepare_chunk_noise`.
+            action_noise: Optional noise to apply to the action channels.
             state_noise: Optional noise to apply to the state channels.
             chunk_noise: Optional tensor that sets the noise for both action and
                 state channels. If provided, it must already be expanded to
                 ``(horizon, batch_size * n_samples, self.x_stacked_shape[0])`` or
                 ``(horizon, batch_size, self.x_stacked_shape[0])``.
+            num_steps: Number of consecutive steps to return. Defaults to
+                ``self.exec_step`` when ``None``.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: ``(next_action, next_state)`` each
-            with shape ``(num_envs * n_samples, dim)`` in the original (de-normalized)
-            space.
+            Tuple[torch.Tensor, torch.Tensor]: ``(action_chunk, state_chunk)``
+            each with shape ``(num_steps, batch, dim)`` in the original
+            (de-normalized) space.
         """
 
-        # if buffer len is less than 2, return mean action and mean state
+        device = getattr(self, "device", torch.device("cuda"))
+        if num_steps is None:
+            num_steps = max(1, getattr(self, "exec_step", 1))
+        else:
+            num_steps = max(1, num_steps)
+
         if len(self.root_state_buffer.buffer) < 2:
-            return torch.from_numpy(self.a_mean).cuda().repeat(self.num_envs, 1)
+            base_action = torch.from_numpy(self.a_mean).to(device).repeat(self.num_envs, 1)
+            base_state = torch.from_numpy(self.state_mean).to(device).repeat(self.num_envs, 1)
+            action_chunk = base_action.unsqueeze(0).repeat(num_steps, 1, 1)
+            state_chunk = base_state.unsqueeze(0).repeat(num_steps, 1, 1)
+            return action_chunk, state_chunk
         
         if not hasattr(self, "guidance_fn"):
             self.guidance_fn = None
@@ -1056,10 +1069,39 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
         action_exec = action_pred[self.H:].permute(1, 0, 2).float()
         state_exec = state_pred[self.H:].permute(1, 0, 2).float()
 
-        next_action = action_exec[:, 0]
-        next_state = state_exec[:, 0]
+        total_steps = action_exec.shape[1]
+        steps_to_take = min(num_steps, total_steps)
+        action_slice = action_exec[:, :steps_to_take]
+        state_slice = state_exec[:, :steps_to_take]
 
-        return next_action
+        action_chunk = action_slice.permute(1, 0, 2).contiguous()
+        state_chunk = state_slice.permute(1, 0, 2).contiguous()
+
+        if action_chunk.shape[0] < num_steps:
+            pad_len = num_steps - action_chunk.shape[0]
+            action_pad = action_chunk[-1:].repeat(pad_len, 1, 1)
+            state_pad = state_chunk[-1:].repeat(pad_len, 1, 1)
+            action_chunk = torch.cat([action_chunk, action_pad], dim=0)
+            state_chunk = torch.cat([state_chunk, state_pad], dim=0)
+
+        return action_chunk, state_chunk
+
+    @torch.no_grad()
+    def predict_one_step(self, action_noise=None, state_noise=None, chunk_noise=None):
+        """
+        Helper to predict the next action/state pair for the current environment state.
+
+        This mirrors the logic used inside :meth:`interact`, but only returns the
+        first step of the open-loop rollout.
+        """
+
+        action_chunk, _ = self.predict_chunk(
+            action_noise=action_noise,
+            state_noise=state_noise,
+            chunk_noise=chunk_noise,
+            num_steps=1,
+        )
+        return action_chunk[0]
 
     def set_normalization_stats(self, action_mean, action_std, state_mean, state_std):
         self.a_mean = action_mean
