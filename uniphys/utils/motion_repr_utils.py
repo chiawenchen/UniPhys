@@ -18,6 +18,10 @@ REPR_LIST_ROOT_DOF_JOINT = [
              'dof_pose_6d', 'dof_vel',  # smplx-based local pose
 ]
 
+REPR_LIST_ROOT_ONLY = [
+             'root_trans', 'root_rot_6d','root_trans_vel', 'root_rot_vel',  # smplx-based traj
+]
+
 REPR_LIST_DOF_NO_VEL = [
              'dof_pose_6d' # smplx-based local pose
 ]

@@ -15,6 +15,8 @@ from uniphys.utils.clip_utils import load_and_freeze_clip, encode_text
 from uniphys.utils.motion_repr_utils import (
     REPR_LIST_DOF_JOINT,
     REPR_LIST_ROOT_DOF_JOINT,
+    REPR_LIST_ROOT_ONLY,
+    REPR_LIST_ROOT_DOF,
     get_repr,
     cano_seq_smpl_or_smplx_batch,
 )
@@ -35,6 +37,17 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
         self.norm_action = cfg.norm_action
         self.observation_dim = self.action_dim + self.state_dim
         assert self.observation_dim == cfg.observation_shape[0]
+
+        state_mode = cfg.get("state_repr_mode", None)
+        if state_mode is None:
+            state_mode = "root_local" if cfg.get("state_with_root", True) else "local"
+        self.state_repr_mode = state_mode
+        self.state_includes_root = self.state_repr_mode in ("root_local", "root_only", "root_dof")
+        self.state_includes_local = self.state_repr_mode in ("root_local", "local")
+        # Keep legacy flag in sync for downstream code that might still read it
+        # Set it on cfg before passing to super().__init__() since self.cfg doesn't exist yet
+        cfg.state_with_root = self.state_includes_root
+
         self.stabilization_schedule = cfg.diffusion.stabilization_schedule
         self.exec_step = cfg.diffusion.exec_step
 
@@ -44,8 +57,11 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             self.ema_decay = cfg.diffusion.ema_decay
             self.ema_model = None
 
-        self.text_embedding_dict = joblib.load("UniPhys/data/babel_state-action-text-pairs/text_embedding_dict_clip.pkl")
+        self.text_embedding_dict = joblib.load(cfg.text_embedding_dict_path)
         super().__init__(cfg)
+     
+        # Now that self.cfg exists, ensure it's set there too (in case downstream code reads from self.cfg)
+        self.cfg.state_with_root = self.state_includes_root
 
         ## for saving episodes
         self.pred_dof_pos, self.pred_dof_pos_all = [], []
@@ -69,6 +85,17 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
         self.joint_pos_buffer = FixedLengthBuffer(self.cfg.n_frames)
         self.self_obs_buffer = FixedLengthBuffer(self.cfg.n_frames)
         self.action_buffer = FixedLengthBuffer(self.cfg.n_frames)
+
+    def _state_repr_names(self):
+        if self.state_repr_mode == "root_local":
+            return REPR_LIST_ROOT_DOF_JOINT
+        if self.state_repr_mode == "root_only":
+            return REPR_LIST_ROOT_ONLY
+        if self.state_repr_mode == "root_dof":
+            return REPR_LIST_ROOT_DOF
+        if self.state_repr_mode == "local":
+            return REPR_LIST_DOF_JOINT
+        raise ValueError(f"Unsupported state representation mode: {self.state_repr_mode}")
 
     def _clear_hist_buffer(self):
         self.root_state_buffer.clear()
@@ -123,12 +150,31 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             self.ema_model.update_parameters(self.diffusion_model)
 
     def load_state_dict(self, state_dict, strict=True):
-        if self.use_ema and "ema_state_dict" in state_dict:
-            # This is likely from an EMA checkpoint, load the EMA weights
-            ema_state_dict = state_dict.pop("ema_state_dict")
-            super().load_state_dict(ema_state_dict, strict=False)
-        else:
-            super().load_state_dict(state_dict, strict=False)
+        # Handle EMA state dict separately
+        ema_state_dict = state_dict.pop("ema_state_dict", None)
+        
+        # Load main model weights
+        super().load_state_dict(state_dict, strict=False)
+        
+        # Load EMA model weights if available and EMA is enabled
+        if self.use_ema:
+            if self.ema_model is None:
+                # Initialize EMA model if it doesn't exist yet (requires diffusion_model to be built)
+                if not hasattr(self, 'diffusion_model') or self.diffusion_model is None:
+                    raise RuntimeError("Cannot initialize EMA model: diffusion_model must be built first. "
+                                     "Ensure _build_model() is called before load_state_dict().")
+                self.ema_model = AveragedModel(
+                    self.diffusion_model,
+                    avg_fn=lambda avg_model_param, model_param, num_averaged: self.ema_decay * avg_model_param
+                    + (1 - self.ema_decay) * model_param,
+                )
+                self.ema_model.to(self.device)
+            
+            if ema_state_dict is not None:
+                # Load EMA weights into the EMA model if available
+                self.ema_model.module.load_state_dict(ema_state_dict, strict=False)
+            # If EMA weights are not available, the EMA model will be initialized with main model weights
+            # (which happens automatically when AveragedModel is created)
 
     def on_save_checkpoint(self, checkpoint):
         if self.use_ema:
@@ -137,26 +183,32 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
 
     def on_train_epoch_end(self, ) -> None:
         if (torch.cuda.current_device() == 0) & self.cfg.play:
-            if self.use_ema and self.ema_model is not None:
-                self.ema_model.eval()
-            else:
-                self.diffusion_model.eval()
-
             current_epoch = self.current_epoch
             if (self.current_epoch + 1) % 100 == 0 or self.current_epoch == 0:
+                # Save optimizer state before evaluation
+                optimizer_state = self.trainer.optimizers[0].state_dict()
+
+                if self.use_ema and self.ema_model is not None:
+                    self.ema_model.eval()
+                else:
+                    self.diffusion_model.eval()
+
                 mean_episode_length, std_episode_length, max_episode_length, min_episode_length, num_played_games = self.interact(save=False)
-                
+
                 self.log("mean_episode_length", mean_episode_length, on_step=False, on_epoch=True, sync_dist=True)
                 self.log("std_episode_length", std_episode_length, on_step=False, on_epoch=True, sync_dist=True)
                 self.log("max_episode_length", max_episode_length, on_step=False, on_epoch=True, sync_dist=True)
                 self.log("min_episode_length", min_episode_length, on_step=False, on_epoch=True, sync_dist=True)
                 print(f"Epoch[{current_epoch}] -- Mean Episode length [{mean_episode_length:.2f}] -- Std Episode length [{std_episode_length:.2f}] -- Played games [{num_played_games}]")
-                
+
                 if self.use_ema and self.ema_model is not None:
                     # self.ema_model.train() # ignore
                     pass
                 else:
                     self.diffusion_model.train()
+
+                # Restore optimizer state after evaluation
+                self.trainer.optimizers[0].load_state_dict(optimizer_state)
 
 
     def _preprocess_batch(self, batch):
@@ -201,7 +253,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
 
             state_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim:].reshape(*loss.shape[:2], -1)
             
-            if self.cfg.state_with_root:
+            if self.state_repr_mode == "root_local":
                 root_trans_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim:self.action_dim+3].reshape(*loss.shape[:2], -1)
                 root_rot_6d_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+3:self.action_dim+9].reshape(*loss.shape[:2], -1)
                 root_trans_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+9:self.action_dim+12].reshape(*loss.shape[:2], -1)
@@ -219,7 +271,34 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
                 local_pos_vel_loss = self.reweight_loss(local_pos_vel_loss, masks)
                 dof_pose_loss = self.reweight_loss(dof_pose_loss, masks)
                 dof_vel_loss = self.reweight_loss(dof_vel_loss, masks)
-            else:
+            elif self.state_repr_mode == "root_only":
+                root_trans_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim:self.action_dim+3].reshape(*loss.shape[:2], -1)
+                root_rot_6d_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+3:self.action_dim+9].reshape(*loss.shape[:2], -1)
+                root_trans_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+9:self.action_dim+12].reshape(*loss.shape[:2], -1)
+                root_rot_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+12:self.action_dim+15].reshape(*loss.shape[:2], -1)
+
+                root_trans_loss = self.reweight_loss(root_trans_loss, masks)
+                root_rot_6d_loss = self.reweight_loss(root_rot_6d_loss, masks)
+                root_trans_vel_loss = self.reweight_loss(root_trans_vel_loss, masks)
+                root_rot_vel_loss = self.reweight_loss(root_rot_vel_loss, masks)
+            elif self.state_repr_mode == "root_dof":
+                # root_dof: root_rot_6d(6) + root_rot_vel(3) + root_trans(3) + root_trans_vel(3) + dof_pose_6d(23*6) + dof_vel(23*3)
+                root_rot_6d_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim:self.action_dim+6].reshape(*loss.shape[:2], -1)
+                root_rot_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+6:self.action_dim+9].reshape(*loss.shape[:2], -1)
+                root_trans_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+9:self.action_dim+12].reshape(*loss.shape[:2], -1)
+                root_trans_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+12:self.action_dim+15].reshape(*loss.shape[:2], -1)
+                dof_pose_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+15:self.action_dim+15+23*6].reshape(*loss.shape[:2], -1)
+                dof_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+15+23*6:self.action_dim+15+23*6+23*3].reshape(*loss.shape[:2], -1)
+                local_pos_loss = torch.tensor(0.0, device=loss.device)
+                local_pos_vel_loss = torch.tensor(0.0, device=loss.device)
+
+                root_trans_loss = self.reweight_loss(root_trans_loss, masks)
+                root_rot_6d_loss = self.reweight_loss(root_rot_6d_loss, masks)
+                root_trans_vel_loss = self.reweight_loss(root_trans_vel_loss, masks)
+                root_rot_vel_loss = self.reweight_loss(root_rot_vel_loss, masks)
+                dof_pose_loss = self.reweight_loss(dof_pose_loss, masks)
+                dof_vel_loss = self.reweight_loss(dof_vel_loss, masks)
+            elif self.state_repr_mode == "local":
                 local_pos_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim:self.action_dim+24*3].reshape(*loss.shape[:2], -1)
                 local_pos_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+24*3:self.action_dim+24*3+24*3].reshape(*loss.shape[:2], -1)
                 dof_pose_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, -23*9:-23*3].reshape(*loss.shape[:2], -1)
@@ -229,6 +308,8 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
                 local_pos_vel_loss = self.reweight_loss(local_pos_vel_loss, masks)
                 dof_pose_loss = self.reweight_loss(dof_pose_loss, masks)
                 dof_vel_loss = self.reweight_loss(dof_vel_loss, masks)
+            else:
+                raise ValueError(f"Unsupported state representation mode: {self.state_repr_mode}")
 
 
             z_loss = self.reweight_loss(z_loss, masks)
@@ -236,7 +317,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
 
             dim_masks = torch.ones((1, 1, loss.shape[-1])).cuda()
 
-            if self.cfg.state_with_root:
+            if self.state_includes_root:
                 dim_masks[..., self.action_dim:self.action_dim+15] = 1
 
             loss = self.reweight_loss(loss * dim_masks, masks)
@@ -248,7 +329,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             action_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, :self.action_dim].reshape(*loss.shape[:2], -1)
             state_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim:].reshape(*loss.shape[:2], -1)
 
-            if self.cfg.state_with_root:
+            if self.state_repr_mode == "root_local":
                 root_trans_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim:self.action_dim+3].reshape(*loss.shape[:2], -1)
                 root_rot_6d_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+3:self.action_dim+9].reshape(*loss.shape[:2], -1)
                 root_trans_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+9:self.action_dim+12].reshape(*loss.shape[:2], -1)
@@ -266,7 +347,34 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
                 local_pos_vel_loss = self.reweight_loss(local_pos_vel_loss, masks)
                 dof_pose_loss = self.reweight_loss(dof_pose_loss, masks)
                 dof_vel_loss = self.reweight_loss(dof_vel_loss, masks)
-            else:
+            elif self.state_repr_mode == "root_only":
+                root_trans_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim:self.action_dim+3].reshape(*loss.shape[:2], -1)
+                root_rot_6d_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+3:self.action_dim+9].reshape(*loss.shape[:2], -1)
+                root_trans_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+9:self.action_dim+12].reshape(*loss.shape[:2], -1)
+                root_rot_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+12:self.action_dim+15].reshape(*loss.shape[:2], -1)
+
+                root_trans_loss = self.reweight_loss(root_trans_loss, masks)
+                root_rot_6d_loss = self.reweight_loss(root_rot_6d_loss, masks)
+                root_trans_vel_loss = self.reweight_loss(root_trans_vel_loss, masks)
+                root_rot_vel_loss = self.reweight_loss(root_rot_vel_loss, masks)
+            elif self.state_repr_mode == "root_dof":
+                # root_dof: root_rot_6d(6) + root_rot_vel(3) + root_trans(3) + root_trans_vel(3) + dof_pose_6d(23*6) + dof_vel(23*3)
+                root_rot_6d_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim:self.action_dim+6].reshape(*loss.shape[:2], -1)
+                root_rot_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+6:self.action_dim+9].reshape(*loss.shape[:2], -1)
+                root_trans_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+9:self.action_dim+12].reshape(*loss.shape[:2], -1)
+                root_trans_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+12:self.action_dim+15].reshape(*loss.shape[:2], -1)
+                dof_pose_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+15:self.action_dim+15+23*6].reshape(*loss.shape[:2], -1)
+                dof_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+15+23*6:self.action_dim+15+23*6+23*3].reshape(*loss.shape[:2], -1)
+                local_pos_loss = torch.tensor(0.0, device=loss.device)
+                local_pos_vel_loss = torch.tensor(0.0, device=loss.device)
+
+                root_trans_loss = self.reweight_loss(root_trans_loss, masks)
+                root_rot_6d_loss = self.reweight_loss(root_rot_6d_loss, masks)
+                root_trans_vel_loss = self.reweight_loss(root_trans_vel_loss, masks)
+                root_rot_vel_loss = self.reweight_loss(root_rot_vel_loss, masks)
+                dof_pose_loss = self.reweight_loss(dof_pose_loss, masks)
+                dof_vel_loss = self.reweight_loss(dof_vel_loss, masks)
+            elif self.state_repr_mode == "local":
                 local_pos_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim:self.action_dim+24*3].reshape(*loss.shape[:2], -1)
                 local_pos_vel_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, self.action_dim+24*3:self.action_dim+24*3+24*3].reshape(*loss.shape[:2], -1)
                 dof_pose_loss = loss.reshape(*loss.shape[:2], -1, self.frame_stack)[:, :, -23*9:-23*3].reshape(*loss.shape[:2], -1)
@@ -276,6 +384,8 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
                 local_pos_vel_loss = self.reweight_loss(local_pos_vel_loss, masks)
                 dof_pose_loss = self.reweight_loss(dof_pose_loss, masks)
                 dof_vel_loss = self.reweight_loss(dof_vel_loss, masks)
+            else:
+                raise ValueError(f"Unsupported state representation mode: {self.state_repr_mode}")
         
             action_loss = self.reweight_loss(action_loss, masks)
             state_loss = self.reweight_loss(state_loss, masks)
@@ -287,16 +397,13 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             self.log("training/z_loss", z_loss, on_step=True, on_epoch=False, sync_dist=True)
             self.log("training/state_loss", state_loss, on_step=True, on_epoch=False, sync_dist=True)
 
-            if self.cfg.state_with_root:
+            if self.state_includes_root:
                 self.log("training/root_trans_loss", root_trans_loss, on_step=True, on_epoch=False, sync_dist=True)
                 self.log("training/root_rot_6d_loss", root_rot_6d_loss, on_step=True, on_epoch=False, sync_dist=True)
                 self.log("training/root_trans_vel_loss", root_trans_vel_loss, on_step=True, on_epoch=False, sync_dist=True)
                 self.log("training/root_rot_vel_loss", root_rot_vel_loss, on_step=True, on_epoch=False, sync_dist=True)
-                self.log("training/local_pos_loss", local_pos_loss, on_step=True, on_epoch=False, sync_dist=True)
-                self.log("training/local_pos_vel_loss", local_pos_vel_loss, on_step=True, on_epoch=False, sync_dist=True)
-                self.log("training/dof_pose_loss", dof_pose_loss, on_step=True, on_epoch=False, sync_dist=True)
-                self.log("training/dof_vel_loss", dof_vel_loss, on_step=True, on_epoch=False, sync_dist=True)
-            else:
+
+            if self.state_includes_local:
                 self.log("training/local_pos_loss", local_pos_loss, on_step=True, on_epoch=False, sync_dist=True)
                 self.log("training/local_pos_vel_loss", local_pos_vel_loss, on_step=True, on_epoch=False, sync_dist=True)
                 self.log("training/dof_pose_loss", dof_pose_loss, on_step=True, on_epoch=False, sync_dist=True)
@@ -329,7 +436,6 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             states.append(state)
 
         return torch.from_numpy(np.stack(states)).cuda()
-
 
     def _prepare_chunk_noise(
         self,
@@ -450,9 +556,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
         # -------------------------------------------------------
         # Select representation list depending on root inclusion
         # -------------------------------------------------------
-        REPR_LIST = (
-            REPR_LIST_ROOT_DOF_JOINT if self.cfg.state_with_root else REPR_LIST_DOF_JOINT
-        )
+        REPR_LIST = self._state_repr_names()
 
         # -------------------------------------------------------
         # Collect buffered history (limited by context length)
@@ -615,6 +719,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             state_pred = state_pred * torch.from_numpy(self.state_std).cuda() + torch.from_numpy(self.state_mean).cuda()
 
         return action_pred, state_pred
+
     
 
     @torch.no_grad()
@@ -623,7 +728,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
         # === Environment setup ===
         self.env.task._termination_distances[:] = 1e6
         self.env.task.termination_mode = "sampling"
-        num_envs = self.num_envs = self.env.task.num_envs
+        num_envs = self.env.task.num_envs
         self.max_episode_length = self.env.task.max_episode_length
 
         pbar = tqdm(self.max_episode_length)
@@ -639,9 +744,8 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
         self._clear_hist_buffer()
 
         # === Action Mean and Std stats ===
-        REPR_LIST = (
-            REPR_LIST_ROOT_DOF_JOINT if self.cfg.state_with_root else REPR_LIST_DOF_JOINT
-        )
+        REPR_LIST = self._state_repr_names()
+
         if self.norm_action:
             if self.cfg.action_keys == ["action"]:
                 self.a_mean, self.a_std = self.action_mean, self.action_std
@@ -848,9 +952,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
         self._clear_hist_buffer()
 
         # === Action Mean and Std stats ===
-        REPR_LIST = (
-            REPR_LIST_ROOT_DOF_JOINT if self.cfg.state_with_root else REPR_LIST_DOF_JOINT
-        )
+        REPR_LIST = self._state_repr_names()
 
         if self.norm_action:
             if self.cfg.action_keys == ["action"]:
@@ -1004,6 +1106,7 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
             save_path = os.path.join(save_dir, "saved_episodes.pkl")
             joblib.dump(final_data, save_path)
             print(f"Saved {len(final_data['text'])} episodes to {save_path}")
+
 
     @torch.no_grad()
     def predict_chunk(
