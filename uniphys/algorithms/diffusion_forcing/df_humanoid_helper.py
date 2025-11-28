@@ -1221,7 +1221,8 @@ class DiffusionForcingHumanoid(DiffusionForcingBase):
 
     def preprocess_text(self):
         # preprocess text
-        if not self.cfg.skip_text and self.guidance_params > 0:
+        if not self.cfg.skip_text and self.cfg.guidance_params > 0:
+            self.guidance_params = self.cfg.guidance_params
             if self.cfg.interactive_input_prompt:
                 if flags.prompt:
                     text = input("\033[34mEnter the text prompt: \033[0m")
