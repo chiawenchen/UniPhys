@@ -1,5 +1,6 @@
 import joblib
 import numpy as np
+import time
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -47,7 +48,6 @@ class DiffusionForcingHumanoidGoal(DiffusionForcingHumanoid):
     def post_step(self, info, done, save_dir=None, max_episode_length=None):
         if max_episode_length is None:
             max_episode_length = self.max_episode_length
-
         if save_dir is not None:
             self.pred_pos_all.append(info["body_pos"])
             self.pred_dof_pos_all.append(info["dof_pos"])
@@ -207,6 +207,7 @@ class DiffusionForcingHumanoidGoal(DiffusionForcingHumanoid):
         Main interaction loop: runs episodes, samples trajectories, executes actions,
         checks goal completion, and logs results.
         """
+        save = True
         # === Environment setup ===
         self.env.task._termination_distances[:] = 1e6
         self.env.task.termination_mode = "sampling"
@@ -239,13 +240,16 @@ class DiffusionForcingHumanoidGoal(DiffusionForcingHumanoid):
         self.env.task.completed_episode_lengths = []
 
         self.max_episode_length = self.env.task.max_episode_length
-        self.max_episode = 50
+        self.max_episode = 1000
         max_steps = (self.max_episode + 1) * self.max_episode_length
 
         # === Loop ===
         t, e, count, reset_flag = 0, 0, 0, False
         sequential_goal = False # True - reset env after each goal; False - keep going after reaching each goal
         break_flag = False
+
+        # === Start time tracking ===
+        start_time = time.time()
 
         ## === Save dir ===
         if save:
@@ -387,7 +391,7 @@ class DiffusionForcingHumanoidGoal(DiffusionForcingHumanoid):
                         if distance < 1:
                             self.exec_step = 4 # Replan more frequently when close to goal
                         else:
-                            self.exec_step = 8
+                            self.exec_step = 4
 
                         # succ criteria: within 0.3m for 5 consecutive steps
                         if distance < 0.3:
@@ -403,12 +407,14 @@ class DiffusionForcingHumanoidGoal(DiffusionForcingHumanoid):
                                 break
 
                         done = self.post_step(info, done.clone(), save_dir=save_dir)
+                        success = sum(task_complete)
+                        total = len(task_complete)
 
-                        self.success_rate = sum(task_complete) / len(task_complete) if len(task_complete) > 0 else 0
+                        self.success_rate = success / total if total > 0 else 0
                         
                         self.pbar.update(1)
                         self.pbar.refresh()
-                        update_str = f"Episode: {e+1}/{self.max_episode} | Steps {n}/{self.max_episode_length} | Distance {distance:.3f} | Succ rate: {self.success_rate:.3f}"
+                        update_str = f"Episode: {e+1}/{self.max_episode} | Steps {n}/{self.max_episode_length} | Distance {distance:.3f} | Succ rate: {self.success_rate:.3f} | Success: {success} | Total: {total}"
                         self.pbar.set_description(update_str)
                     
                     if break_flag:
@@ -427,26 +433,47 @@ class DiffusionForcingHumanoidGoal(DiffusionForcingHumanoid):
                 e += 1
             break_flag = False
 
-        self.pred_pos_all = np.stack(self.pred_pos_all).squeeze()
-        self.pred_dof_pos_all = np.stack(self.pred_dof_pos_all).squeeze()
-        self.root_state_all = np.stack(self.root_state_all).squeeze()
-        self.dof_state_all = np.stack(self.dof_state_all).squeeze()
-        self.action_all = np.stack(self.action_all).squeeze()
-        self.zs_all = np.stack(self.zs_all).squeeze()
-        self.goal_positions_all = np.stack(self.goal_positions_all).squeeze()
+        # === Calculate and print total time and frames ===
+        total_time = time.time() - start_time
+        total_frames = t
+        print(f"\n{'='*60}")
+        print(f"Rollout completed!")
+        print(f"Total time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+        print(f"Total frames: {total_frames}")
+        print(f"FPS: {total_frames / total_time:.2f}")
+        print(f"Success rate: {(sum(task_complete) / len(task_complete)):.3f}")
+        print(f"Success: {sum(task_complete)} | Total: {len(task_complete)}")
+        print(f"{'='*60}\n")
 
-        save_info = {"body_pos": self.pred_pos_all, 
-                     "dof_pos": self.pred_dof_pos_all, 
-                     "root_state": self.root_state_all, 
-                     "dof_state": self.dof_state_all, 
-                     "action": self.action_all, 
-                     "z": self.zs_all, 
-                     "goal_position": self.goal_positions_all,
-                     "success_rate": self.success_rate,
-                     "task_complete": task_complete,
-                     "episode_length": episode_length_list
-                     }
-        
-        joblib.dump(save_info, os.path.join(save_dir, "goal_reaching_e{}_succ{}.pkl".format(len(task_complete), int(sum(task_complete)))))
-        # print("Goal reaching task completed. Success rate: {}".format(sum(task_complete) / len(task_complete) if len(task_complete) > 0 else 0))
-        print("Saved at {}".format(os.path.join(save_dir, "goal_reaching_e{}_succ{}.pkl".format(len(task_complete), int(sum(task_complete))))))
+        # Only stack and save if save_dir is not None (i.e., save=True) and lists are not empty
+        if save_dir is not None and len(self.pred_pos_all) > 0:
+            self.pred_pos_all = np.stack(self.pred_pos_all).squeeze()
+            self.pred_dof_pos_all = np.stack(self.pred_dof_pos_all).squeeze()
+            self.root_state_all = np.stack(self.root_state_all).squeeze()
+            self.dof_state_all = np.stack(self.dof_state_all).squeeze()
+            self.action_all = np.stack(self.action_all).squeeze()
+            if len(self.zs_all) > 0:
+                self.zs_all = np.stack(self.zs_all).squeeze()
+            else:
+                self.zs_all = np.array([])
+            self.goal_positions_all = np.stack(self.goal_positions_all).squeeze()
+
+            save_info = {"body_pos": self.pred_pos_all, 
+                         "dof_pos": self.pred_dof_pos_all, 
+                         "root_state": self.root_state_all, 
+                         "dof_state": self.dof_state_all, 
+                         "action": self.action_all, 
+                         "z": self.zs_all, 
+                         "goal_position": self.goal_positions_all,
+                         "success_rate": self.success_rate,
+                         "task_complete": task_complete,
+                         "episode_length": episode_length_list,
+                         "total_time": total_time,
+                         "total_frames": total_frames
+                         }
+            
+            joblib.dump(save_info, os.path.join(save_dir, "goal_reaching_e{}_succ{}.pkl".format(len(task_complete), int(sum(task_complete)))))
+            # print("Goal reaching task completed. Success rate: {}".format(sum(task_complete) / len(task_complete) if len(task_complete) > 0 else 0))
+            print("Saved at {}".format(os.path.join(save_dir, "goal_reaching_e{}_succ{}.pkl".format(len(task_complete), int(sum(task_complete))))))
+        elif save_dir is not None:
+            print("Warning: save_dir is set but no data was collected. Skipping save.")
