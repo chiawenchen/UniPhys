@@ -35,6 +35,7 @@ external_cond_dim: 0
 cond_mask_prob: 0.1
 # motion representation related
 state_with_root: True
+state_repr_mode: "root_local"
 
 diffusion:
   use_ema: False

@@ -504,11 +504,21 @@ def main(cfg_hydra: DictConfig) -> None:
     else:
         experiment = run_local(cfg_diffusion)
 
-    cfg_diffusion.dataset.state_dim = 351
-    cfg_diffusion.dataset.repr_name_list = ['local_positions', 'local_vel', 'dof_pose_6d', 'dof_vel']
-    if cfg_diffusion.algorithm.state_with_root:
-        cfg_diffusion.dataset.state_dim = 351 + 3 + 6 + 3 + 3
-        cfg_diffusion.dataset.repr_name_list = ['root_trans', 'root_rot_6d', 'root_trans_vel', 'root_rot_vel', 'local_positions', 'local_vel', 'dof_pose_6d', 'dof_vel']
+    if cfg_diffusion.algorithm.state_repr_mode == "root_local":
+        cfg_diffusion.dataset.state_dim = 351
+        cfg_diffusion.dataset.repr_name_list = ['local_positions', 'local_vel', 'dof_pose_6d', 'dof_vel']
+        if cfg_diffusion.algorithm.state_with_root:
+            cfg_diffusion.dataset.state_dim = 351 + 3 + 6 + 3 + 3
+            cfg_diffusion.dataset.repr_name_list = ['root_trans', 'root_rot_6d', 'root_trans_vel', 'root_rot_vel', 'local_positions', 'local_vel', 'dof_pose_6d', 'dof_vel']
+
+    elif cfg_diffusion.algorithm.state_repr_mode == "root_dof":
+        cfg_diffusion.dataset.state_dim = 207
+        cfg_diffusion.dataset.repr_name_list = ['dof_pose_6d', 'dof_vel']
+        if cfg_diffusion.algorithm.state_with_root:
+            cfg_diffusion.dataset.state_dim = 207 + 3 + 6 + 3 + 3
+            cfg_diffusion.dataset.repr_name_list = ['root_trans', 'root_rot_6d', 'root_trans_vel', 'root_rot_vel', 'dof_pose_6d', 'dof_vel']
+    else:
+        raise ValueError(f"Invalid state representation mode: {cfg_diffusion.algorithm.state_repr_mode}")
 
     cfg_diffusion.dataset.observation_shape = [cfg_diffusion.dataset.state_dim + cfg_diffusion.dataset.action_dim]
     cfg_diffusion.algorithm.state_dim = cfg_diffusion.dataset.state_dim
